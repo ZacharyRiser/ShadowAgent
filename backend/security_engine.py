@@ -1,9 +1,4 @@
-"""Core purification engine skeleton for Shadow Agent.
-
-The functions in this module are intentionally lightweight for Task 1. Later
-iterations can replace the heuristic checks with local embedding models,
-DeepSeek-based audit calls, policy stores, and per-tool permission graphs.
-"""
+"""Core purification engine for Shadow Agent."""
 
 from __future__ import annotations
 
@@ -12,17 +7,41 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+CONTEXT_TAG_PATTERN = re.compile(
+    r"<(?P<tag>context|external_context|retrieved_context|tool_result|data)\b[^>]*>"
+    r"(?P<body>.*?)"
+    r"</(?P=tag)>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+INJECTION_SIGNATURES = [
+    "ignore previous instructions",
+    "ignore all previous instructions",
+    "disregard previous instructions",
+    "system prompt",
+    "bypass",
+    "you are now",
+    "developer mode",
+    "jailbreak",
+    "reveal hidden instructions",
+    "泄露系统提示词",
+    "忽略之前的指令",
+    "忽略以上指令",
+]
+
 INJECTION_PATTERNS = [
+    re.compile(re.escape(signature), re.IGNORECASE)
+    for signature in INJECTION_SIGNATURES
+] + [
     re.compile(r"\bignore (all )?(previous|prior|above) instructions\b", re.IGNORECASE),
     re.compile(r"\bdisregard (all )?(previous|prior|above) instructions\b", re.IGNORECASE),
     re.compile(r"\b忽略(以上|前述|之前|所有).{0,12}(指令|规则|要求)\b", re.IGNORECASE),
-    re.compile(r"\b越权\b|\b泄露\b|\b系统提示词\b|\bsystem prompt\b", re.IGNORECASE),
 ]
 
-BLOCKED_TOOLS = {
-    "shell.exec",
-    "filesystem.delete",
-    "credential.dump",
+ALLOWED_TOOLS = {
+    "search_web": True,
+    "read_file": False,
+    "execute_shell": False,
 }
 
 
@@ -35,33 +54,32 @@ class AuditDecision:
 
 
 def separate_instruction_and_data(prompt: str, external_context: str | None) -> dict[str, str]:
-    """Separate trusted user intent from untrusted external data.
+    """Separate trusted user intent from tagged untrusted context blocks."""
 
-    Future logic:
-    - Preserve the user's direct instruction as the only trusted command source.
-    - Wrap retrieval/API/tool output as inert data with provenance metadata.
-    - Tag spans by origin, confidence, and whether the model may treat them as
-      executable instructions.
-    - Feed the separated representation into the policy engine instead of
-      concatenating prompt and context directly.
-    """
+    extracted_contexts: list[str] = []
 
+    def collect_context(match: re.Match[str]) -> str:
+        extracted_contexts.append(match.group("body").strip())
+        return " "
+
+    trusted_instruction = CONTEXT_TAG_PATTERN.sub(collect_context, prompt).strip()
+    raw_external_context = (external_context or "").strip()
+    sanitized_external_context = CONTEXT_TAG_PATTERN.sub(
+        collect_context,
+        raw_external_context,
+    ).strip()
+    if sanitized_external_context:
+        extracted_contexts.append(sanitized_external_context)
+
+    untrusted_data = "\n\n".join(item for item in extracted_contexts if item)
     return {
-        "trusted_instruction": prompt.strip(),
-        "untrusted_data": (external_context or "").strip(),
+        "trusted_instruction": trusted_instruction,
+        "untrusted_data": untrusted_data,
     }
 
 
 def semantic_intent_check(text: str) -> AuditDecision:
-    """Check whether text attempts to override policy or steer tool use.
-
-    Future logic:
-    - Replace keyword heuristics with semantic similarity against malicious
-      intent exemplars and a compact local moderation model.
-    - Score indirect prompt injection, credential exfiltration, command
-      execution requests, role-play bypasses, and policy override attempts.
-    - Return calibrated risk scores for dynamic allow/review/block decisions.
-    """
+    """Detect prompt-injection intent with lightweight signatures."""
 
     if not text:
         return AuditDecision(allowed=True)
@@ -81,21 +99,13 @@ def semantic_intent_check(text: str) -> AuditDecision:
 
 
 def permission_control(tool_name: str | None, parameters: dict[str, Any] | None) -> AuditDecision:
-    """Validate whether a tool call is permitted in the current runtime policy.
-
-    Future logic:
-    - Resolve user/session/tool/plugin identity and load its least-privilege
-      policy.
-    - Check requested arguments against allowlists, deny rules, rate limits,
-      data sensitivity labels, and runtime sandbox level.
-    - Emit structured authorization evidence for dashboard review.
-    """
+    """Validate whether a tool call is permitted by the simulated sandbox."""
 
     if not tool_name:
         return AuditDecision(allowed=True)
 
     normalized_tool_name = tool_name.strip().lower()
-    if normalized_tool_name in BLOCKED_TOOLS:
+    if ALLOWED_TOOLS.get(normalized_tool_name) is not True:
         return AuditDecision(
             allowed=False,
             reason="tool_not_permitted",
