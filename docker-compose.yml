@@ -1,0 +1,92 @@
+# Shadow Agent — local/production compose stack.
+#
+# Copy .env.example to .env, fill in the secrets, then:
+#   docker compose up -d --build
+#
+# Required secrets fail fast at startup (JWT signing key, static API keys).
+# The backend persists its SQLite database in the shadowagent-data volume.
+
+name: shadowagent
+
+services:
+  backend:
+    build:
+      context: ./backend
+      # Set to "true" plus SHADOW_AGENT_REDIS_URL to enable shared rate-limit
+      # and login-lockout state across replicas (high-availability mode).
+      args:
+        INSTALL_REDIS: ${SHADOW_AGENT_ENABLE_REDIS:-false}
+    restart: unless-stopped
+    ports:
+      - "${SHADOW_AGENT_BACKEND_PORT:-8000}:8000"
+    environment:
+      SHADOW_AGENT_JWT_SECRET: ${SHADOW_AGENT_JWT_SECRET:?Set SHADOW_AGENT_JWT_SECRET in .env (32+ random characters)}
+      SHADOW_AGENT_ADMIN_API_KEY: ${SHADOW_AGENT_ADMIN_API_KEY:?Set SHADOW_AGENT_ADMIN_API_KEY in .env}
+      SHADOW_AGENT_CLIENT_API_KEY: ${SHADOW_AGENT_CLIENT_API_KEY:?Set SHADOW_AGENT_CLIENT_API_KEY in .env}
+      SHADOW_AGENT_API_KEY_PEPPER: ${SHADOW_AGENT_API_KEY_PEPPER:?Set SHADOW_AGENT_API_KEY_PEPPER in .env}
+      SHADOW_AGENT_CONSOLE_BOOTSTRAP_TOKEN: ${SHADOW_AGENT_CONSOLE_BOOTSTRAP_TOKEN:-}
+      SHADOW_AGENT_ALLOW_OPEN_CONSOLE_BOOTSTRAP: ${SHADOW_AGENT_ALLOW_OPEN_CONSOLE_BOOTSTRAP:-false}
+      SHADOW_AGENT_ALLOWED_ORIGINS: ${SHADOW_AGENT_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      # Multi-tenancy + OIDC SSO: where the console SPA lives (SSO callback
+      # redirect target) and how the IdP reaches this backend (redirect_uri).
+      SHADOW_AGENT_CONSOLE_URL: ${SHADOW_AGENT_CONSOLE_URL:-http://localhost:3000}
+      SHADOW_AGENT_PUBLIC_BASE_URL: ${SHADOW_AGENT_PUBLIC_BASE_URL:-http://localhost:8000}
+      SHADOW_AGENT_UPSTREAM_BASE_URL: ${SHADOW_AGENT_UPSTREAM_BASE_URL:-}
+      SHADOW_AGENT_UPSTREAM_API_KEY: ${SHADOW_AGENT_UPSTREAM_API_KEY:-}
+      SHADOW_AGENT_UPSTREAM_MODEL: ${SHADOW_AGENT_UPSTREAM_MODEL:-}
+      SHADOW_AGENT_ALLOW_SIMULATED_RESPONSES: ${SHADOW_AGENT_ALLOW_SIMULATED_RESPONSES:-false}
+      SHADOW_AGENT_SEMANTIC_MODE: ${SHADOW_AGENT_SEMANTIC_MODE:-enforce}
+      SHADOW_AGENT_SEMANTIC_THRESHOLD: ${SHADOW_AGENT_SEMANTIC_THRESHOLD:-}
+      SHADOW_AGENT_RESPONSE_DLP_MODE: ${SHADOW_AGENT_RESPONSE_DLP_MODE:-redact}
+      # deny (default) keeps the tool allowlist strict; set "allow" when
+      # connecting real agents whose tool names are not enumerated as policies.
+      SHADOW_AGENT_UNKNOWN_TOOL_POLICY: ${SHADOW_AGENT_UNKNOWN_TOOL_POLICY:-deny}
+      # How much of a prompt is masked before it is written to intercept_logs /
+      # audit_logs: secrets (default) | full | off. "off" stores payloads as
+      # received and is only for forensic deployments.
+      SHADOW_AGENT_LOG_REDACT: ${SHADOW_AGENT_LOG_REDACT:-secrets}
+      # Request body ceiling in bytes (default 2 MiB); 0 disables the guard.
+      SHADOW_AGENT_MAX_BODY_BYTES: ${SHADOW_AGENT_MAX_BODY_BYTES:-2097152}
+      # /docs, /redoc and /openapi.json are opt-in: they map every route,
+      # including the admin-only ones, for an unauthenticated caller.
+      SHADOW_AGENT_DOCS_ENABLED: ${SHADOW_AGENT_DOCS_ENABLED:-false}
+      # Upstream resilience: retries only cover connect-phase failures and 429s
+      # (a chat completion is not idempotent), bounded by attempt count and a
+      # wall-clock budget; the breaker fails fast instead of queueing.
+      SHADOW_AGENT_UPSTREAM_RETRY_MAX: ${SHADOW_AGENT_UPSTREAM_RETRY_MAX:-2}
+      SHADOW_AGENT_UPSTREAM_RETRY_BUDGET_SECONDS: ${SHADOW_AGENT_UPSTREAM_RETRY_BUDGET_SECONDS:-90}
+      SHADOW_AGENT_UPSTREAM_CIRCUIT_THRESHOLD: ${SHADOW_AGENT_UPSTREAM_CIRCUIT_THRESHOLD:-5}
+      SHADOW_AGENT_UPSTREAM_CIRCUIT_COOLDOWN_SECONDS: ${SHADOW_AGENT_UPSTREAM_CIRCUIT_COOLDOWN_SECONDS:-30}
+      # Off by default: upstream traffic (prompts/completions) must not silently
+      # ride an HTTP(S)_PROXY inherited from the environment.
+      SHADOW_AGENT_UPSTREAM_TRUST_ENV: ${SHADOW_AGENT_UPSTREAM_TRUST_ENV:-false}
+      SHADOW_AGENT_REDIS_URL: ${SHADOW_AGENT_REDIS_URL:-}
+      SHADOW_AGENT_LOG_RETENTION_DAYS: ${SHADOW_AGENT_LOG_RETENTION_DAYS:-180}
+      SHADOW_AGENT_AUDIT_LOG_RETENTION_DAYS: ${SHADOW_AGENT_AUDIT_LOG_RETENTION_DAYS:-365}
+      SHADOW_AGENT_RETENTION_CLEANUP_INTERVAL_SECONDS: ${SHADOW_AGENT_RETENTION_CLEANUP_INTERVAL_SECONDS:-3600}
+      SHADOW_AGENT_ALERT_WEBHOOK_URL: ${SHADOW_AGENT_ALERT_WEBHOOK_URL:-}
+      SHADOW_AGENT_ALERT_WEBHOOK_SECRET: ${SHADOW_AGENT_ALERT_WEBHOOK_SECRET:-}
+    volumes:
+      - shadowagent-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # URL the BROWSER uses to reach the backend (same host, mapped port).
+        NEXT_PUBLIC_SHADOW_AGENT_API_BASE: ${SHADOW_AGENT_PUBLIC_API_BASE:-http://localhost:8000}
+    restart: unless-stopped
+    ports:
+      - "${SHADOW_AGENT_FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  shadowagent-data:

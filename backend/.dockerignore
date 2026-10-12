@@ -1,0 +1,19 @@
+# Never bake secrets or local state into the image.
+.env
+.env.local
+*.db
+*.db-shm
+*.db-wal
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+*.log
+*.err.log
+backup*/
+_backup*/
+test_gateway.py
+test_integration.py
+broken_access_control_probe.py
+start_public.ps1
+codex-*.log

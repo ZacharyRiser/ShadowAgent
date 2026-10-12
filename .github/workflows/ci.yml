@@ -1,0 +1,206 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  # The performance gate is manual-only: see the `perf-gate` job comment.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend-tests:
+    name: Backend tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run test suite
+        run: python -m pytest tests -v
+
+      - name: Verify Alembic migrations apply cleanly
+        env:
+          SHADOW_AGENT_DATABASE_PATH: /tmp/ci-migration-check.db
+        run: |
+          python -m alembic upgrade head
+          python -c "import sqlite3; c=sqlite3.connect('/tmp/ci-migration-check.db'); tables=[r[0] for r in c.execute(\"SELECT name FROM sqlite_master WHERE type='table'\")]; expected={'alembic_version','alert_events','approval_requests','audit_logs','console_users','intercept_logs','managed_api_keys','replay_runs','security_policies','tool_policies'}; missing=expected-set(tables); assert not missing, f'missing tables: {missing}'; print('migration check OK:', len(tables), 'tables')"
+
+  backend-tests-redis:
+    name: Backend tests (shared Redis state)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      SHADOW_AGENT_REDIS_TEST_URL: redis://127.0.0.1:6379/15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements-redis.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt -r requirements-redis.txt
+
+      - name: Run shared-state tests against live Redis
+        run: python -m pytest tests/test_shared_state.py -v
+
+  frontend-build:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      # The suite covers decision logic only (email shape, the registration copy
+      # that once reported an outage as "registration disabled"). It runs in a
+      # bare Node environment — no jsdom, no rendered components — so it stays
+      # fast and cannot fail for DOM reasons.
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+  perf-gate:
+    name: Gateway performance gate (manual)
+    # Manual dispatch only. The gate uses *relative* criteria (no 5xx, no
+    # client timeouts, blocked path not dramatically slower than the allowed
+    # path, pool starvation == 0) precisely because absolute throughput is not
+    # reproducible — but a shared CI runner is still a noisy place to judge
+    # latency ratios, and a gate that fails for hardware reasons trains people
+    # to ignore it. Run it from the Actions tab after touching the request
+    # path, the pool sizing, or anything under app/middleware.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run the gate
+        env:
+          # Keep the harness off any real provider; it drives the app in-process.
+          SHADOW_AGENT_UPSTREAM_BASE_URL: ""
+          SHADOW_AGENT_ALLOW_SIMULATED_RESPONSES: "true"
+        run: python tools/perf_gate.py
+
+  dependency-audit:
+    name: Dependency vulnerability scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Not pinned in requirements-dev.txt: a scanner is only useful if it can
+      # pick up new parsers and advisory sources, and it never ships in the
+      # image. The range keeps it on a known-major version.
+      - name: Install pip-audit
+        run: pip install "pip-audit>=2.7,<3"
+
+      # Blocking. Verified clean on 2026-09-26: cryptography 48.0.0 carried 4
+      # advisories (3 HIGH) and was bumped to 50.0.1, the first patch release
+      # with an empty OSV report for that package.
+      # --strict also fails when the dependency graph cannot be resolved, so a
+      # package that disappears upstream cannot silently turn this job green.
+      # Waive a specific advisory only with `--ignore-vuln <ID>` plus a comment
+      # saying why, and track it like any other accepted risk.
+      - name: Audit backend runtime dependencies
+        working-directory: backend
+        run: pip-audit -r requirements.txt --strict
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # Blocking, same as the backend step. Verified clean on 2026-09-27 after
+      # the dependency refresh: the lockfile (437 packages, 58 in the
+      # production tree) has zero advisories in OSV, which covers the same
+      # GitHub Security Advisories npm audit reports.
+      # `frontend/tools/osv_npm_audit.py --prod-only` reproduces the result
+      # from the lockfile through OSV when the registry audit endpoint is
+      # unreachable.
+      #
+      # --omit=dev (2026-10-08): aligns this gate with the backend gate, which
+      # audits requirements.txt (runtime) and never requirements-dev.txt. The
+      # shipped artifact (Docker image) contains only the production tree.
+      # At the time of writing `braces` (reached only via
+      # eslint-config-next -> fast-glob -> micromatch, lint tooling) has NO
+      # fixed release for GHSA-vfj7-8cjw-p6xm, so auditing the dev tree would
+      # block CI on an unfixable advisory. Dev-dependency regressions are
+      # still caught by Dependabot's normal update flow.
+      - name: Audit frontend dependencies
+        working-directory: frontend
+        run: npm audit --omit=dev --audit-level=high
+
+  docker-build:
+    name: Docker image build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build backend image
+        run: docker build -t shadowagent-backend-ci ./backend
+
+      - name: Build frontend image
+        run: docker build -t shadowagent-frontend-ci ./frontend

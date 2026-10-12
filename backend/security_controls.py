@@ -2,27 +2,31 @@
 
 from __future__ import annotations
 
-import base64
-import binascii
 import hashlib
 import hmac
 import ipaddress
 import json
+import logging
 import os
 import re
 import secrets
 import time
+import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+
+import jwt as pyjwt
 
 from fastapi import HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.security.utils import get_authorization_scheme_param
 
 from database import SessionLocal
-from models import ManagedApiKey
+from models import ConsoleUser, ManagedApiKey
+
+logger = logging.getLogger("shadow_agent.security")
 
 
 ADMIN_ROLES = {"admin", "security_admin"}
@@ -51,9 +55,20 @@ MANAGED_API_KEY_PREFIX = "sak"
 
 @dataclass(frozen=True, slots=True)
 class Principal:
+    """Authenticated caller.
+
+    ``org_id`` / ``org_role`` carry the active tenant context: console JWTs
+    always include the organization the user switched into, managed API keys
+    resolve to the organization that owns them. ``org_id is None`` marks a
+    *platform* principal (static env keys, platform-managed keys) which keeps
+    pre-tenancy, see-everything behavior.
+    """
+
     subject: str
     role: str
     auth_method: str
+    org_id: int | None = None
+    org_role: str | None = None
 
 
 class InMemoryRateLimiter:
@@ -76,7 +91,227 @@ class InMemoryRateLimiter:
         return True, 0
 
 
-rate_limiter = InMemoryRateLimiter()
+class InMemoryLoginThrottle:
+    """Track failed console logins per account to slow brute-force attacks."""
+
+    def __init__(self) -> None:
+        self._failures: dict[str, deque[float]] = defaultdict(deque)
+
+    def _prune(self, key: str, now: float, window_seconds: float) -> None:
+        bucket = self._failures[key]
+        while bucket and now - bucket[0] > window_seconds:
+            bucket.popleft()
+
+    def locked_out_remaining(
+        self,
+        key: str,
+        *,
+        max_failures: int,
+        window_seconds: float,
+    ) -> int:
+        now = time.monotonic()
+        self._prune(key, now, window_seconds)
+        bucket = self._failures[key]
+        if len(bucket) >= max(1, max_failures):
+            return max(1, int(window_seconds - (now - bucket[0])))
+        return 0
+
+    def record_failure(self, key: str, *, window_seconds: float) -> None:
+        now = time.monotonic()
+        self._prune(key, now, window_seconds)
+        self._failures[key].append(now)
+
+    def record_success(self, key: str) -> None:
+        self._failures.pop(key, None)
+
+
+# --- Optional Redis-backed shared state for multi-instance deployments ---
+#
+# Set SHADOW_AGENT_REDIS_URL to share the rate limiter and login throttle
+# across gateway replicas. Without it (or when Redis is unreachable at
+# startup) the process-local in-memory implementations below are used, which
+# is correct for single-instance deployments.
+#
+# Runtime Redis failures degrade fail-open with an error log: availability of
+# the gateway takes precedence over throttling precision.
+
+_SLIDING_WINDOW_LUA = """
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+local member = ARGV[4]
+
+redis.call('ZREMRANGEBYSCORE', key, 0, now - window)
+local count = redis.call('ZCARD', key)
+if count >= limit then
+    local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+    if #oldest > 1 then
+        local retry = math.ceil(window - (now - tonumber(oldest[2])))
+        if retry < 1 then retry = 1 end
+        return {0, retry}
+    end
+    return {0, 1}
+end
+redis.call('ZADD', key, now, member)
+redis.call('PEXPIRE', key, math.ceil(window * 1000 * 2))
+return {1, 0}
+"""
+
+_LOCKOUT_REMAINING_LUA = """
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local max_failures = tonumber(ARGV[3])
+
+redis.call('ZREMRANGEBYSCORE', key, 0, now - window)
+local count = redis.call('ZCARD', key)
+if count >= max_failures then
+    local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+    if #oldest > 1 then
+        local retry = math.ceil(window - (now - tonumber(oldest[2])))
+        if retry < 1 then retry = 1 end
+        return retry
+    end
+    return math.ceil(window)
+end
+return 0
+"""
+
+_shared_redis_client: Any = None
+_shared_redis_initialized = False
+
+
+def _get_shared_redis_client() -> Any:
+    """Lazily connect to Redis when SHADOW_AGENT_REDIS_URL is configured.
+
+    Returns None (single-instance memory mode) when the variable is unset,
+    the redis package is missing, or the server cannot be reached.
+    """
+    global _shared_redis_client, _shared_redis_initialized
+
+    if _shared_redis_initialized:
+        return _shared_redis_client
+
+    _shared_redis_initialized = True
+    _shared_redis_client = None
+
+    url = os.getenv("SHADOW_AGENT_REDIS_URL", "").strip()
+    if not url:
+        return None
+
+    try:
+        import redis
+    except ImportError:
+        logger.error(
+            "SHADOW_AGENT_REDIS_URL is set but the 'redis' package is not installed; "
+            "falling back to in-memory shared state (single-instance mode). "
+            "Install it with: pip install redis"
+        )
+        return None
+
+    try:
+        client = redis.Redis.from_url(url, socket_timeout=2, socket_connect_timeout=2)
+        client.ping()
+    except Exception as exc:
+        logger.error(
+            "Cannot reach Redis at the configured SHADOW_AGENT_REDIS_URL; falling "
+            "back to in-memory shared state (single-instance mode): %s",
+            exc,
+        )
+        return None
+
+    logger.info("Shared state backend: Redis (%s)", url)
+    _shared_redis_client = client
+    return _shared_redis_client
+
+
+class RedisRateLimiter:
+    """Sliding-window rate limiter backed by a Redis sorted set (atomic via Lua)."""
+
+    def __init__(self, client: Any, prefix: str = "shadow_agent:rate") -> None:
+        self._client = client
+        self._prefix = prefix
+        self._check_script = client.register_script(_SLIDING_WINDOW_LUA)
+
+    def check(self, key: str, limit: int, window_seconds: int) -> tuple[bool, int]:
+        try:
+            allowed, retry_after = self._check_script(
+                keys=[f"{self._prefix}:{key}"],
+                args=[time.time(), window_seconds, limit, uuid.uuid4().hex],
+            )
+            return bool(int(allowed)), int(retry_after)
+        except Exception as exc:
+            logger.error("Redis rate limiter failed; allowing request (fail-open): %s", exc)
+            return True, 0
+
+
+class RedisLoginThrottle:
+    """Login failure tracking backed by Redis so lockouts span all replicas."""
+
+    def __init__(self, client: Any, prefix: str = "shadow_agent:login") -> None:
+        self._client = client
+        self._prefix = prefix
+        self._lockout_script = client.register_script(_LOCKOUT_REMAINING_LUA)
+
+    def locked_out_remaining(
+        self,
+        key: str,
+        *,
+        max_failures: int,
+        window_seconds: float,
+    ) -> int:
+        try:
+            return int(
+                self._lockout_script(
+                    keys=[f"{self._prefix}:{key}"],
+                    args=[time.time(), window_seconds, max(1, max_failures)],
+                )
+            )
+        except Exception as exc:
+            logger.error("Redis login throttle lookup failed (fail-open): %s", exc)
+            return 0
+
+    def record_failure(self, key: str, *, window_seconds: float) -> None:
+        try:
+            redis_key = f"{self._prefix}:{key}"
+            now = time.time()
+            pipe = self._client.pipeline()
+            pipe.zremrangebyscore(redis_key, 0, now - window_seconds)
+            pipe.zadd(redis_key, {uuid.uuid4().hex: now})
+            pipe.pexpire(redis_key, int(window_seconds * 1000 * 2))
+            pipe.execute()
+        except Exception as exc:
+            logger.error("Redis login throttle record failed: %s", exc)
+
+    def record_success(self, key: str) -> None:
+        try:
+            self._client.delete(f"{self._prefix}:{key}")
+        except Exception as exc:
+            logger.error("Redis login throttle reset failed: %s", exc)
+
+
+def _build_rate_limiter() -> InMemoryRateLimiter | RedisRateLimiter:
+    client = _get_shared_redis_client()
+    if client is not None:
+        return RedisRateLimiter(client)
+    return InMemoryRateLimiter()
+
+
+def _build_login_throttle() -> InMemoryLoginThrottle | RedisLoginThrottle:
+    client = _get_shared_redis_client()
+    if client is not None:
+        return RedisLoginThrottle(client)
+    return InMemoryLoginThrottle()
+
+
+def shared_state_backend() -> str:
+    """Report which backend holds rate-limit/lockout state (for /health)."""
+    return "redis" if _get_shared_redis_client() is not None else "memory"
+
+
+rate_limiter = _build_rate_limiter()
+login_throttle = _build_login_throttle()
 
 
 def _env_secret(name: str) -> str | None:
@@ -87,9 +322,22 @@ def _env_secret(name: str) -> str | None:
 
 
 def _jwt_secret() -> str | None:
-    configured = _env_secret("SHADOW_AGENT_JWT_SECRET")
+    # The JWT signing key must be configured explicitly. Deriving it from the
+    # static API keys would let any client-key holder forge admin JWTs, so that
+    # fallback has been removed (console login now requires SHADOW_AGENT_JWT_SECRET).
+    return _env_secret("SHADOW_AGENT_JWT_SECRET")
+
+
+def _api_key_pepper() -> str | None:
+    configured = _env_secret("SHADOW_AGENT_API_KEY_PEPPER")
     if configured:
         return configured
+
+    # Fallback chain preserves hashes created by earlier versions:
+    # explicit pepper -> JWT secret -> derived from static API keys.
+    jwt_secret = _env_secret("SHADOW_AGENT_JWT_SECRET")
+    if jwt_secret:
+        return jwt_secret
 
     admin_key = _env_secret("SHADOW_AGENT_ADMIN_API_KEY") or ""
     client_key = _env_secret("SHADOW_AGENT_CLIENT_API_KEY") or ""
@@ -97,13 +345,6 @@ def _jwt_secret() -> str | None:
         return None
 
     return hashlib.sha256(f"{admin_key}|{client_key}|shadow-agent-jwt".encode("utf-8")).hexdigest()
-
-
-def _api_key_pepper() -> str | None:
-    configured = _env_secret("SHADOW_AGENT_API_KEY_PEPPER")
-    if configured:
-        return configured
-    return _jwt_secret()
 
 
 def _unauthorized(message: str = "Authentication required.") -> HTTPException:
@@ -145,15 +386,6 @@ def _api_key_pepper_not_configured() -> HTTPException:
             ),
         },
     )
-
-
-def _b64url_decode(value: str) -> bytes:
-    padding = "=" * (-len(value) % 4)
-    return base64.urlsafe_b64decode(value + padding)
-
-
-def _b64url_encode(value: bytes) -> str:
-    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
 
 
 def hash_password(password: str) -> str:
@@ -302,12 +534,7 @@ def create_jwt(
     if extra_claims:
         payload.update(extra_claims)
 
-    header = {"alg": "HS256", "typ": "JWT"}
-    header_b64 = _b64url_encode(json.dumps(header, separators=(",", ":")).encode("utf-8"))
-    payload_b64 = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
-    signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
-    signature = hmac.new(secret.encode("utf-8"), signing_input, hashlib.sha256).digest()
-    token = f"{header_b64}.{payload_b64}.{_b64url_encode(signature)}"
+    token = pyjwt.encode(payload, secret, algorithm="HS256")
     return token, payload["exp"]
 
 
@@ -325,43 +552,52 @@ def _verify_jwt(token: str) -> Principal | None:
         )
 
     try:
-        header_b64, payload_b64, signature_b64 = token.split(".", 2)
-        header = json.loads(_b64url_decode(header_b64))
-        payload = json.loads(_b64url_decode(payload_b64))
-        signature = _b64url_decode(signature_b64)
-    except (binascii.Error, ValueError, json.JSONDecodeError, UnicodeDecodeError):
-        raise _unauthorized("Malformed JWT.")
-
-    if header.get("alg") != "HS256" or header.get("typ") not in (None, "JWT"):
-        raise _unauthorized("Unsupported JWT header.")
-
-    signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
-    expected = hmac.new(secret.encode("utf-8"), signing_input, hashlib.sha256).digest()
-    if not hmac.compare_digest(signature, expected):
-        raise _unauthorized("Invalid JWT signature.")
-
-    now = int(time.time())
-    try:
-        expires_at = int(payload["exp"])
-        not_before = int(payload["nbf"]) if "nbf" in payload else None
-    except (KeyError, TypeError, ValueError):
-        raise _unauthorized("JWT must include numeric exp and optional numeric nbf.")
-
-    if expires_at < now:
+        payload = pyjwt.decode(
+            token,
+            secret,
+            algorithms=["HS256"],
+            options={"require": ["exp", "sub"]},
+        )
+    except pyjwt.ExpiredSignatureError:
         raise _unauthorized("JWT has expired.")
-    if not_before is not None and not_before > now:
+    except pyjwt.ImmatureSignatureError:
         raise _unauthorized("JWT is not valid yet.")
+    except pyjwt.InvalidAlgorithmError:
+        raise _unauthorized("Unsupported JWT header.")
+    except pyjwt.PyJWTError:
+        raise _unauthorized("Invalid or malformed JWT.")
 
     role = str(payload.get("role", "client"))
     subject = str(payload.get("sub", "jwt-subject"))
-    return Principal(subject=subject, role=role, auth_method="jwt")
+
+    org_id: int | None = None
+    raw_org_id = payload.get("org_id")
+    if isinstance(raw_org_id, int):
+        org_id = raw_org_id
+    elif isinstance(raw_org_id, str) and raw_org_id.isdigit():
+        try:
+            org_id = int(raw_org_id)
+        except ValueError:
+            org_id = None
+
+    org_role = payload.get("org_role")
+    org_role = str(org_role) if org_role else None
+
+    return Principal(
+        subject=subject,
+        role=role,
+        auth_method="jwt",
+        org_id=org_id,
+        org_role=org_role,
+    )
 
 
-def _verify_api_key(request: Request) -> Principal | None:
+def _verify_api_key(request: Request, bearer_credentials: str = "") -> Principal | None:
     presented = (
         request.headers.get("x-api-key")
         or request.headers.get("x-admin-api-key")
         or request.headers.get("x-client-api-key")
+        or bearer_credentials
     )
     if not presented:
         return None
@@ -412,6 +648,7 @@ def _verify_managed_api_key(request: Request, presented: str) -> Principal | Non
             subject=f"managed-api-key:{api_key.id}",
             role=api_key.role,
             auth_method="managed_api_key",
+            org_id=api_key.org_id,
         )
     finally:
         db.close()
@@ -433,16 +670,76 @@ def _managed_api_keys_configured() -> bool:
         db.close()
 
 
+def _verify_console_user_active(principal: Principal) -> Principal:
+    """Re-check console user state so disabled users lose access immediately.
+
+    Also re-validates the claimed organization: if the user was removed from
+    the organization (or the organization was deleted) the token's org claims
+    go stale, and every org-scoped request must be rejected.
+    """
+
+    prefix = "console-user:"
+    if not principal.subject.startswith(prefix):
+        return principal
+
+    try:
+        user_id = int(principal.subject[len(prefix):])
+    except ValueError:
+        raise _unauthorized("Invalid console user token.")
+
+    db = SessionLocal()
+    try:
+        user = db.query(ConsoleUser).filter(ConsoleUser.id == user_id).one_or_none()
+        if user is not None and principal.org_id is not None:
+            from models import OrganizationMembership
+
+            membership = (
+                db.query(OrganizationMembership)
+                .filter(
+                    OrganizationMembership.user_id == user_id,
+                    OrganizationMembership.org_id == principal.org_id,
+                )
+                .one_or_none()
+            )
+            if membership is None:
+                raise _unauthorized(
+                    "Your account no longer has access to this organization."
+                )
+            if principal.org_role is not None and membership.role != principal.org_role:
+                principal = Principal(
+                    subject=principal.subject,
+                    role=principal.role,
+                    auth_method=principal.auth_method,
+                    org_id=principal.org_id,
+                    org_role=membership.role,
+                )
+    finally:
+        db.close()
+
+    if user is None or not user.is_active:
+        raise _unauthorized("Console user is inactive or no longer exists.")
+    return principal
+
+
+def _looks_like_jwt(credentials: str) -> bool:
+    """Heuristic: real JWTs are `header.payload.signature` (two dots)."""
+    return credentials.count(".") == 2
+
+
 def _authenticate(request: Request) -> Principal:
     authorization = request.headers.get("authorization")
     scheme, credentials = get_authorization_scheme_param(authorization)
+    bearer_credentials = credentials if scheme.lower() == "bearer" and credentials else ""
 
-    if scheme.lower() == "bearer" and credentials:
-        principal = _verify_jwt(credentials)
+    # Bearer tokens that look like a JWT must verify as one (errors surface
+    # immediately). Anything else (e.g. `sak_...` managed keys or plain env
+    # keys sent by OpenAI-style SDKs) falls through to the API-key path.
+    if bearer_credentials and _looks_like_jwt(bearer_credentials):
+        principal = _verify_jwt(bearer_credentials)
         if principal:
-            return principal
+            return _verify_console_user_active(principal)
 
-    principal = _verify_api_key(request)
+    principal = _verify_api_key(request, bearer_credentials=bearer_credentials)
     if principal:
         return principal
 
@@ -478,7 +775,14 @@ def sanitize_request_id(value: str | None) -> str:
     return REQUEST_ID_PATTERN.sub("-", value)[:96]
 
 
-def redact_text(value: str, max_chars: int = 4000) -> str:
+def redact_sensitive_assignments(value: str) -> str:
+    """Mask ``key=value`` credential assignments and ``Bearer <token>``.
+
+    Only the two ``SENSITIVE_TEXT_PATTERNS`` shapes; no truncation. Split out of
+    :func:`redact_text` so a caller that composes further redaction (see
+    ``app.dlp.redact_for_log``) can reuse the exact same substitution instead of
+    re-implementing it.
+    """
     redacted = value
     for pattern in SENSITIVE_TEXT_PATTERNS:
         redacted = pattern.sub(
@@ -489,6 +793,11 @@ def redact_text(value: str, max_chars: int = 4000) -> str:
             ),
             redacted,
         )
+    return redacted
+
+
+def redact_text(value: str, max_chars: int = 4000) -> str:
+    redacted = redact_sensitive_assignments(value)
     if len(redacted) > max_chars:
         return redacted[:max_chars] + "...[truncated]"
     return redacted

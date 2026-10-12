@@ -1,0 +1,71 @@
+# Dependency updates.
+#
+# Scope, and why it is deliberately narrow:
+#
+# * The two ecosystems that ship in the product (backend runtime deps, frontend
+#   production tree) are covered. `dependency-audit` in CI already *blocks* on
+#   known advisories, so a bump here mostly saves the manual refresh.
+# * Grouped minor/patch PRs, because a stream of single-package PRs is how a
+#   review queue gets ignored — and this repository's discipline is "no gate
+#   that is red on day one".
+# * Majors are not grouped, so they arrive one at a time and get read.
+#
+# Prerequisite that cannot live in this file: Dependabot **security** updates
+# need "Dependabot alerts" enabled in repository settings; this file only
+# configures version updates.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /backend
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - backend
+    groups:
+      backend-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - frontend
+    groups:
+      frontend-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    ignore:
+      # `next` / `react` / `react-dom` / `eslint-config-next` are exact-pinned on
+      # purpose: the frontend was refreshed to 16.3.6 as a coherent set (the
+      # eslint config must move with `next`). Let Dependabot open one PR per
+      # version so the set can be adopted together instead of drifting apart.
+      - dependency-name: next
+      - dependency-name: eslint-config-next
+      - dependency-name: react
+      - dependency-name: react-dom
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    labels:
+      - dependencies
+      - ci

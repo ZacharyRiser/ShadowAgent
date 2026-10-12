@@ -1,4 +1,14 @@
-fastapi>=0.115.13
-uvicorn[standard]>=0.30.0
-httpx>=0.27.0
-sqlalchemy>=2.0.0
+# Runtime dependencies (pinned for reproducible production deployments).
+# Upgrade deliberately: bump, run `python -m pytest tests`, then re-pin.
+fastapi==0.136.1
+uvicorn[standard]==0.46.0
+httpx==0.28.1
+SQLAlchemy==2.0.49
+PyJWT==2.15.0
+# 48.0.0 carried 4 advisories (3 HIGH): the bundled OpenSSL OOB read
+# (GHSA-537c-gmf6-5ccf, fixed 48.0.1) plus CVE-2026-69247/69248/69249, whose
+# fixes land at 49.0.0 and 50.0.0. 50.0.1 is the first patch release with a
+# clean OSV report for this package; verified with
+# `pip-audit -r requirements.txt --strict` (see .github/workflows/ci.yml).
+cryptography==50.0.1
+alembic==1.18.4

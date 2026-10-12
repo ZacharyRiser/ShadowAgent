@@ -1,0 +1,3 @@
+# Optional shared-state backend for multi-instance (high-availability) deployments.
+# Install on top of requirements.txt and set SHADOW_AGENT_REDIS_URL.
+redis==8.1.0

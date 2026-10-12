@@ -71,7 +71,27 @@ playwright-report/
 *.sqlite
 *.sqlite3
 *.db
+*.db-shm
+*.db-wal
 
 # Local-only Shadow Agent artifacts
 tempCodeRunnerFile.exe
 backend/codex-public-keys.env
+_backup_modularization/
+
+# Agent workspace (session memory / local tool state)
+.workbuddy/
+
+# Chrome CDP 截图临时产物
+# profile 目录含上千文件且不应入库；_token.txt 是临时管理令牌（安全红线）；
+# _*.png 是调试期中间图。入库的只有 cdp_shot.py / shoot_all.py 等工具脚本。
+_shots/_chromeprofile*/
+_shots/_cp*/
+_shots/_token.txt
+_shots/_*.png
+_shots/_check_skill.py
+
+# 被取代的历史截图：v2/v3 展示的是重构前的旧设计，留在仓库会误导。
+# 当前态截图是 v4-*（由 _shots/shoot_all.py 一键重生成）。
+docs/screenshots/v2-*
+docs/screenshots/v3-*

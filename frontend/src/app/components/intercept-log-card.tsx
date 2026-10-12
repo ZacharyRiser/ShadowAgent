@@ -1,7 +1,7 @@
-﻿"use client";
+"use client";
 
 import { AnimatePresence, motion, type Variants } from "framer-motion";
-import { AlertTriangle, Clock, Copy, Fingerprint, ShieldAlert, Sparkles } from "lucide-react";
+import { AlertTriangle, Copy, Fingerprint } from "lucide-react";
 import type { KeyboardEvent } from "react";
 import { buildTimeTooltip, formatBeijingTime } from "../time-utils";
 
@@ -19,34 +19,40 @@ type AnimatedInterceptLogListProps = {
   onSelect: (log: InterceptLogCardData) => void;
   onCopyRequestId?: (requestId: string) => void;
   compact?: boolean;
+  /** 窄容器（登录样例卡 / 侧栏）恒用堆叠 3 列，不随视口变化。 */
+  dense?: boolean;
 };
 
 type GlassInterceptLogCardProps = {
   log: InterceptLogCardData;
   index?: number;
   compact?: boolean;
+  /** 窄容器（登录样例卡 / 侧栏）恒用堆叠 3 列，不随视口变化。 */
+  dense?: boolean;
   onSelect: (log: InterceptLogCardData) => void;
   onCopyRequestId?: (requestId: string) => void;
 };
 
+/* 列表级错峰：总时长受限（10 行约 200ms），不随条数线性增长。
+   motion-design.md：错峰要用 --i 变量并限制总时长。 */
 const listVariants: Variants = {
   hidden: { opacity: 0 },
   show: {
     opacity: 1,
-    transition: { staggerChildren: 0.06, delayChildren: 0.04 },
+    transition: { staggerChildren: 0.02, delayChildren: 0.02 },
   },
 };
 
-const cardVariants: Variants = {
-  hidden: { opacity: 0, y: 24, filter: "blur(10px)", scale: 0.985 },
+/* 行入场：只动 opacity 与 transform（GPU 友好）。
+   不用 spring —— motion-design.md 明确避免回弹。 */
+const rowVariants: Variants = {
+  hidden: { opacity: 0, y: 6 },
   show: {
     opacity: 1,
     y: 0,
-    filter: "blur(0px)",
-    scale: 1,
-    transition: { type: "spring", stiffness: 420, damping: 34, mass: 0.72 },
+    transition: { duration: 0.22, ease: [0.16, 1, 0.3, 1] },
   },
-  exit: { opacity: 0, y: 14, filter: "blur(8px)", transition: { duration: 0.16 } },
+  exit: { opacity: 0, transition: { duration: 0.14, ease: [0.4, 0, 1, 1] } },
 };
 
 function detailText(value: unknown): string {
@@ -110,35 +116,32 @@ function asNumber(value: unknown, fallback = 0): number {
   return Number.isFinite(next) ? next : fallback;
 }
 
+/* 风险分档：只保留"档位 + 语义色"两件事。
+   不要发光、不要渐变、不要多层描边 —— 数据表里 40 行同时发光就是噪音。
+   档位靠左侧 2px 竖条 + 文字色传达，不靠整块着色。 */
 function riskMeta(score: number) {
   if (score >= 0.9) {
     return {
-      label: "High",
-      caption: "高危",
-      ring: "border-rose-300/35 bg-rose-500/12 text-[var(--tone-danger-text)] shadow-[0_0_24px_rgba(244,63,94,0.25)]",
-      glow: "from-rose-400/28 via-orange-300/12 to-transparent",
-      dot: "bg-rose-300 shadow-[0_0_12px_rgba(253,164,175,0.85)]",
+      label: "高危",
+      tick: "bg-[var(--tone-danger)]",
+      text: "text-[var(--tone-danger-text)]",
       reason: "检测到覆盖系统指令、泄露隐藏上下文、绕过工具权限或诱导代理执行越权动作的强信号。",
     };
   }
 
   if (score >= 0.65) {
     return {
-      label: "Medium",
-      caption: "中危",
-      ring: "border-amber-200/35 bg-amber-400/12 text-[var(--tone-warning-text)] shadow-[0_0_20px_rgba(251,191,36,0.18)]",
-      glow: "from-amber-300/24 via-yellow-200/10 to-transparent",
-      dot: "bg-amber-200 shadow-[0_0_12px_rgba(253,230,138,0.72)]",
+      label: "中危",
+      tick: "bg-[var(--tone-warning)]",
+      text: "text-[var(--tone-warning-text)]",
       reason: "命中了可疑提示模式，需要结合来源、上下文隔离和工具权限继续审计。",
     };
   }
 
   return {
-    label: "Low",
-    caption: "低危",
-    ring: "border-emerald-200/30 bg-emerald-400/10 text-[var(--tone-success-text)] shadow-[0_0_18px_rgba(52,211,153,0.16)]",
-    glow: "from-emerald-300/18 via-cyan-200/8 to-transparent",
-    dot: "bg-emerald-200 shadow-[0_0_12px_rgba(167,243,208,0.64)]",
+    label: "低危",
+    tick: "bg-[var(--tone-success)]",
+    text: "text-[var(--tone-success-text)]",
     reason: "当前风险信号较弱，但仍保留审计记录，便于追踪间接提示词注入链路。",
   };
 }
@@ -168,9 +171,77 @@ function safeDomId(value: string): string {
   return value.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 80);
 }
 
+/* 布局策略：显式 `dense` 开关，不猜容器宽度。
+
+   为什么不用 @container：Tailwind v4 的容器查询变体要求**父级**声明 `@container`，
+   而列模板与「谁是容器」分散在两处，改动一处就会静默失配（上一版就是这么崩的）。
+   为什么不用 md:/lg: 视口断点：这个组件同时出现在
+   (a) 全宽日志页、(b) 约 360px 宽的登录样例卡、(c) 总览侧栏 ——
+   同一个视口宽度下三者宽度可能相差 3 倍，视口断点必然猜错其中一种。
+
+   → 由调用方显式声明版面：
+     · dense=false（默认）：台账 5 列，`md:` 以下退化为堆叠 3 列
+     · dense=true：恒为堆叠 3 列（竖条 / 内容 / 风险分），窄容器专用
+   列模板字符串集中在本文件，表头与行共用同一常量，结构上不可能错位。 */
+const DENSE_GRID =
+  "grid grid-cols-[3px_minmax(0,1fr)_auto] items-start gap-x-3 gap-y-1.5";
+const WIDE_GRID =
+  "grid grid-cols-[3px_minmax(0,1fr)_auto] items-start gap-x-3 gap-y-1.5 md:grid-cols-[3px_minmax(0,1.1fr)_minmax(0,1.9fr)_minmax(0,0.85fr)_5.25rem] md:items-center md:gap-y-0 md:gap-x-4";
+
+function rowGrid(dense: boolean) {
+  return dense ? DENSE_GRID : WIDE_GRID;
+}
+
+/* 窄容器（dense）与宽容器（wide）下的行内定位。
+   所有跨列/起始行列都显式声明 —— 不依赖自动流（auto-flow）猜位置，
+   否则某个单元格的 col-span 一变，后面的单元格就会被推走（踩过）。
+
+   栅格列： [① 3px 竖条] [② 内容] [③ 风险分]
+   dense 三行：①|② 类型 + ③ 风险分 → ② 载荷（跨 2 列）→ ② 处置（跨 2 列）
+   wide  一行：①|② 类型|② 载荷|② 处置|③ 风险分 对齐全宽台账列宽 */
+function cellsClass(dense: boolean) {
+  return dense
+    ? {
+        tick: "col-start-1 row-span-3 h-8 w-[3px] self-start rounded-full",
+        threat: "col-start-2 row-start-1 min-w-0 truncate",
+        prompt: "col-span-2 col-start-2 row-start-2 min-w-0",
+        action: "col-span-2 col-start-2 row-start-3 flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1",
+        score: "col-start-3 row-start-1 flex justify-end",
+      }
+    : {
+        tick: "col-start-1 row-span-3 h-8 w-[3px] self-start rounded-full md:row-span-1 md:self-center",
+        threat: "col-start-2 row-start-1 min-w-0 truncate md:row-start-auto",
+        prompt: "col-span-2 col-start-2 row-start-2 min-w-0 md:col-span-1 md:col-start-3 md:row-start-auto",
+        action:
+          "col-span-2 col-start-2 row-start-3 flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 md:col-span-1 md:col-start-4 md:row-start-auto md:flex-col md:items-start md:gap-1",
+        score: "col-start-3 row-start-1 flex justify-end md:col-start-5 md:row-start-auto",
+      };
+}
+
+function LogListHeader({ dense = false }: { dense?: boolean }) {
+  const cells = cellsClass(dense);
+  return (
+    <div
+      className={`${rowGrid(dense)} sticky top-0 z-[var(--z-sticky)] border-b border-[var(--panel-border)] bg-[var(--panel-bg-solid)] px-4 py-2 text-[length:var(--text-micro)] font-medium uppercase tracking-[0.08em] text-[var(--text-muted)] sm:px-5`}
+      aria-hidden
+    >
+      <span />
+      <span className={cells.threat}>威胁类型</span>
+      {dense ? null : (
+        <>
+          <span className="hidden md:block">原始载荷</span>
+          <span className="hidden md:block">处置 / 请求 ID</span>
+        </>
+      )}
+      <span className={`${dense ? "col-start-3" : "md:col-start-5"} text-right`}>风险</span>
+    </div>
+  );
+}
+
 export function AnimatedInterceptLogList({
   logs,
   compact = false,
+  dense = false,
   onSelect,
   onCopyRequestId,
 }: AnimatedInterceptLogListProps) {
@@ -179,8 +250,11 @@ export function AnimatedInterceptLogList({
       variants={listVariants}
       initial="hidden"
       animate="show"
-      className={compact ? "space-y-3 p-4" : "space-y-3 p-4 sm:p-5"}
+      className="overflow-hidden"
+      role="table"
+      aria-label="拦截日志列表"
     >
+      <LogListHeader dense={dense} />
       <AnimatePresence mode="popLayout">
         {logs.map((log, index) => (
           <GlassInterceptLogCard
@@ -188,6 +262,7 @@ export function AnimatedInterceptLogList({
             log={log}
             index={index}
             compact={compact}
+            dense={dense}
             onSelect={onSelect}
             onCopyRequestId={onCopyRequestId}
           />
@@ -197,21 +272,56 @@ export function AnimatedInterceptLogList({
   );
 }
 
+/* 骨架屏：加载中也要保持与真实行完全一致的栅格，
+   这样数据到达时不会发生布局跳动（CLS）。
+   interaction-design.md：骨架屏优于 spinner。 */
+export function LogListSkeleton({ rows = 8, dense = false }: { rows?: number; dense?: boolean }) {
+  const cells = cellsClass(dense);
+  return (
+    <div role="status" aria-label="日志加载中" className="overflow-hidden">
+      <LogListHeader dense={dense} />
+      <span className="sr-only">正在加载拦截日志</span>
+      {Array.from({ length: rows }).map((_, i) => (
+        <div
+          key={i}
+          aria-hidden
+          className={`${rowGrid(dense)} border-b border-[var(--divider)] px-4 py-3 last:border-b-0 sm:px-5`}
+        >
+          <span className={`${cells.tick} skeleton`} />
+          <span className="skeleton h-4 w-4/5" />
+          <span className={`${cells.prompt} flex flex-col gap-1.5`}>
+            <span className="skeleton h-3.5 w-full" />
+            <span className="skeleton h-3.5 w-3/5" />
+          </span>
+          <span className={`${cells.action} !flex-col gap-1.5`}>
+            <span className="skeleton h-3.5 w-2/3" />
+            <span className="skeleton h-3 w-4/5" />
+          </span>
+          <span className={cells.score}>
+            <span className="skeleton h-5 w-14" />
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export function GlassInterceptLogCard({
   log,
   index = 0,
   compact = false,
+  dense = false,
   onSelect,
   onCopyRequestId,
 }: GlassInterceptLogCardProps) {
   const score = Math.max(0, Math.min(1, asNumber(log.details.risk_score)));
   const meta = riskMeta(score);
+  const cells = cellsClass(dense);
   const requestId = getRequestId(log);
-  const layer = detailText(log.details.layer) || "prompt";
   const tooltip = buildTooltip(log, meta.reason);
   const tooltipId = `risk-tip-${log.id}-${safeDomId(requestId)}`;
 
-  const handleKeyDown = (event: KeyboardEvent<HTMLElement>) => {
+  const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.key === "Enter" || event.key === " ") {
       event.preventDefault();
       onSelect(log);
@@ -219,98 +329,96 @@ export function GlassInterceptLogCard({
   };
 
   return (
-    <motion.article
+    <motion.div
       layout
-      variants={cardVariants}
+      variants={rowVariants}
       exit="exit"
       custom={index}
       tabIndex={0}
-      role="button"
+      role="row"
       aria-label={`查看拦截日志 ${requestId}`}
       onClick={() => onSelect(log)}
       onKeyDown={handleKeyDown}
-      whileHover={{ y: -2, scale: 1.003 }}
-      whileTap={{ scale: 0.995 }}
-      className="group relative isolate cursor-pointer overflow-visible rounded-md border border-[var(--panel-border-soft)] bg-[var(--panel-bg)] p-px shadow-[var(--panel-shadow)] outline-none backdrop-blur-[28px] transition duration-300 hover:border-[var(--panel-border-strong)] hover:shadow-[var(--panel-shadow-hover)] focus-visible:ring-2 focus-visible:ring-teal-200/45"
+      /* 行不是卡片：没有圆角、没有阴影、没有边框。
+         分隔靠 border-b，hover 靠底色变化。
+         列模板由 rowGrid(dense) 统一提供，表头与行共用，不可能错位。 */
+      className={`${rowGrid(dense)} group relative cursor-pointer border-b border-[var(--divider)] px-4 py-3 outline-none transition-colors duration-[var(--dur-fast)] ease-[var(--ease-out-quart)] last:border-b-0 hover:bg-[var(--surface-sunken)] focus-visible:bg-[var(--surface-sunken)] focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-[var(--tone-accent)] sm:px-5`}
     >
-      <div className={`pointer-events-none absolute inset-x-8 -top-px h-px bg-gradient-to-r ${meta.glow}`} />
-      <div className="pointer-events-none absolute -inset-px rounded-md bg-[radial-gradient(circle_at_18%_0%,rgba(20,184,166,0.17),transparent_38%),radial-gradient(circle_at_96%_10%,rgba(244,63,94,0.12),transparent_34%)] opacity-70 transition group-hover:opacity-100" />
-      <div className="relative rounded-[7px] bg-[var(--log-card-inner)] px-4 py-4 ring-1 ring-[var(--panel-border-soft)] sm:px-5">
-        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-          <div className="min-w-0 flex-1">
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="inline-flex items-center gap-2 rounded-md border border-cyan-200/18 bg-cyan-300/[0.06] px-2.5 py-1 text-xs font-medium text-[var(--tone-info-text)]">
-                <ShieldAlert className="h-3.5 w-3.5" aria-hidden />
-                {log.threat_type || "Prompt Injection"}
-              </span>
-              <span className="inline-flex items-center gap-1.5 rounded-md border border-white/[0.08] bg-white/[0.045] px-2 py-1 font-mono text-[11px] text-[var(--text-secondary)]">
-                <span className={`h-1.5 w-1.5 rounded-full ${meta.dot}`} />
-                {layer}
-              </span>
-              <span className="inline-flex items-center gap-1.5 rounded-md border border-white/[0.08] bg-white/[0.035] px-2 py-1 text-[11px] text-[var(--text-muted)]">
-                <Clock className="h-3.5 w-3.5" aria-hidden />
-                <span title={buildTimeTooltip(log.timestamp)}>{formatBeijingTime(log.timestamp)} CST</span>
-              </span>
-            </div>
+      {/* 风险档位竖条：唯一的颜色信号源；hover 时伸长 25%，随行反馈 */}
+      <span
+        aria-hidden
+        className={`${cells.tick} ${meta.tick} origin-center transition-transform duration-[var(--dur-fast)] ease-[var(--ease-out-quart)] group-hover:scale-y-125`}
+      />
 
-            <p className={`mt-3 max-w-4xl overflow-hidden text-ellipsis text-[var(--text-primary)] ${compact ? "line-clamp-2 text-sm leading-6" : "line-clamp-3 text-sm leading-6"}`}>
-              {log.original_prompt || "No prompt payload captured."}
-            </p>
+      {/* 威胁类型（窄容器下与风险分同行） */}
+      <span className={`${cells.threat} text-[length:var(--text-caption)] font-medium text-[var(--text-primary)]`}>
+        {log.threat_type || "Prompt Injection"}
+      </span>
 
-            <div className="mt-4 flex flex-wrap items-center gap-2 text-xs text-[var(--text-secondary)]">
-              <span className="inline-flex items-center gap-1.5 rounded-md border border-white/[0.08] bg-[var(--surface-raised)] px-2.5 py-1 font-mono text-[var(--text-secondary)]">
-                <Fingerprint className="h-3.5 w-3.5 text-[var(--tone-accent-text)]" aria-hidden />
-                <span className="max-w-[15rem] truncate" title={requestId}>{requestId}</span>
-              </span>
-              <span className="inline-flex items-center gap-1.5 rounded-md border border-rose-200/18 bg-rose-500/[0.075] px-2.5 py-1 text-[var(--tone-danger-text)]">
-                <AlertTriangle className="h-3.5 w-3.5" aria-hidden />
-                {log.action_taken || "Blocked"}
-              </span>
-              {onCopyRequestId ? (
-                <button
-                  type="button"
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    onCopyRequestId(requestId);
-                  }}
-                  className="inline-flex h-7 items-center gap-1.5 rounded-md border border-white/[0.08] bg-white/[0.04] px-2 text-[var(--text-secondary)] transition hover:border-teal-200/25 hover:bg-teal-300/[0.08] hover:text-[var(--tone-accent-text)] focus:outline-none focus:ring-2 focus:ring-teal-200/40"
-                  aria-label={`复制请求 ID ${requestId}`}
-                  title="复制请求 ID"
-                >
-                  <Copy className="h-3.5 w-3.5" aria-hidden />
-                  Copy
-                </button>
-              ) : null}
-            </div>
-          </div>
+      {/* 原始载荷：窄容器下占第二行整宽 */}
+      <span
+        className={`${cells.prompt} font-mono text-[length:var(--text-caption)] leading-6 text-[var(--text-secondary)] line-clamp-2 md:line-clamp-2`}
+        title={log.original_prompt}
+      >
+        {log.original_prompt || "No prompt payload captured."}
+      </span>
 
-          <div className="flex shrink-0 items-center gap-3 lg:flex-col lg:items-end">
-            <div className="relative">
-              <button
-                type="button"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  onSelect(log);
-                }}
-                className={`peer inline-flex min-w-24 items-center justify-center gap-2 rounded-md border px-3 py-2 font-mono text-xs font-semibold tracking-normal transition hover:-translate-y-0.5 focus:outline-none focus:ring-2 focus:ring-teal-200/40 ${meta.ring}`}
-                aria-describedby={tooltipId}
-              >
-                <Sparkles className="h-3.5 w-3.5" aria-hidden />
-                {meta.label}
-                <span className="text-[11px] opacity-70">{score.toFixed(2)}</span>
-              </button>
-              <div
-                id={tooltipId}
-                role="tooltip"
-                className="pointer-events-none absolute right-0 top-[calc(100%+0.7rem)] z-30 w-72 translate-y-1 whitespace-pre-line rounded-md border border-[var(--tooltip-border)] bg-[var(--tooltip-bg)] px-3.5 py-3 text-left text-xs leading-5 text-[var(--tooltip-fg)] opacity-0 shadow-[var(--tooltip-shadow)] backdrop-blur-[22px] transition duration-200 peer-hover:translate-y-0 peer-hover:opacity-100 peer-focus:translate-y-0 peer-focus:opacity-100"
-              >
-                <div className="mb-1.5 font-medium text-[var(--text-primary)]">{meta.caption}风险说明</div>
-                {tooltip}
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </motion.article>
+      {/* 处置 + 请求 ID：窄容器下占第三行 */}
+      <span className={cells.action}>
+        <span className="inline-flex min-w-0 items-center gap-1.5 text-[length:var(--text-caption)] font-medium text-[var(--tone-danger-text)]">
+          <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden />
+          <span className="truncate">{log.action_taken || "Blocked"}</span>
+        </span>
+        <span className="inline-flex min-w-0 items-center gap-1.5 text-[length:var(--text-micro)] text-[var(--text-muted)]">
+          <Fingerprint className="h-3 w-3 shrink-0" aria-hidden />
+          <span className="truncate font-mono" title={requestId}>
+            {requestId}
+          </span>
+          {onCopyRequestId ? (
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                onCopyRequestId(requestId);
+              }}
+              className="tap-target shrink-0 rounded-[var(--radius-xs)] p-0.5 text-[var(--text-muted)] opacity-0 transition-opacity duration-[var(--dur-fast)] hover:text-[var(--tone-accent-text)] focus-visible:opacity-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--tone-accent)] group-hover:opacity-100"
+              aria-label={`复制请求 ID ${requestId}`}
+              title="复制请求 ID"
+            >
+              <Copy className="h-3 w-3" aria-hidden />
+            </button>
+          ) : null}
+        </span>
+      </span>
+
+      {/* 风险分：窄容器下与类型同行（第一行右端） */}
+      <span className={cells.score}>
+        <span className="relative inline-flex">
+          <button
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              onSelect(log);
+            }}
+            className={`peer inline-flex items-center gap-1.5 whitespace-nowrap rounded-[var(--radius-xs)] px-2 py-1 font-mono text-[length:var(--text-caption)] font-semibold tabular-nums outline-none transition-colors duration-[var(--dur-fast)] hover:bg-[var(--surface-raised)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--tone-accent)] ${meta.text}`}
+            aria-describedby={tooltipId}
+          >
+            <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${meta.tick}`} aria-hidden />
+            {score.toFixed(2)}
+            <span className="font-sans text-[length:var(--text-micro)] font-medium whitespace-nowrap text-[var(--text-muted)]">
+              {meta.label}
+            </span>
+          </button>
+          <span
+            id={tooltipId}
+            role="tooltip"
+            className="pointer-events-none absolute right-0 top-[calc(100%+0.5rem)] z-[var(--z-tooltip)] w-72 translate-y-1 whitespace-pre-line rounded-[var(--radius-md)] border border-[var(--tooltip-border)] bg-[var(--tooltip-bg)] px-3.5 py-3 text-left text-[length:var(--text-micro)] leading-5 text-[var(--tooltip-fg)] opacity-0 shadow-[var(--tooltip-shadow)] transition-[opacity,transform] duration-[var(--dur-fast)] ease-[var(--ease-out-quart)] peer-hover:translate-y-0 peer-hover:opacity-100 peer-focus-visible:translate-y-0 peer-focus-visible:opacity-100"
+          >
+            <span className="mb-1.5 block font-medium text-[var(--text-primary)]">{meta.label}风险说明</span>
+            {tooltip}
+          </span>
+        </span>
+      </span>
+    </motion.div>
   );
 }

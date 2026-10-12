@@ -19,6 +19,9 @@ os.environ["SHADOW_AGENT_DATABASE_PATH"] = os.path.join(
     tempfile.gettempdir(),
     f"shadow-agent-smoke-{uuid.uuid4().hex}.db",
 )
+# Keep the smoke test hermetic: ignore any upstream LLM configured in the local
+# .env so the simulated-response path is exercised deterministically.
+os.environ["SHADOW_AGENT_UPSTREAM_BASE_URL"] = ""
 
 from main import app
 
